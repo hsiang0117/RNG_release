@@ -11,6 +11,7 @@
 
 import torch
 from torch import nn
+from utils.data_cache import LazyImage, camera_rays, HOST_SHADOWS
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal, cam_pos_up_forward_to_Rt
 
@@ -18,7 +19,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid, pl_pos, pl_intensity, 
                  full_width=0, full_height=0, crop_offset_x=0, crop_offset_y=0,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", light_dir=None, source_frame=None
                  ):
         super(Camera, self).__init__()
 
@@ -29,9 +30,12 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.source_frame = source_frame
+        self.light_dir = torch.as_tensor(light_dir, dtype=torch.float32, device='cuda') if light_dir is not None else None
+        self._shadow_key = id(self)
         
-        self.pl_pos = torch.tensor(pl_pos, device=data_device).float() if pl_pos is not None else None
-        self.pl_intensity = torch.tensor(pl_intensity, device=data_device).float() if pl_intensity is not None else None
+        self.pl_pos = torch.tensor(pl_pos, device="cuda").float() if pl_pos is not None else None
+        self.pl_intensity = torch.tensor(pl_intensity, device="cuda").float() if pl_intensity is not None else None
         
         self.full_width = full_width
         self.full_height = full_height
@@ -45,14 +49,15 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
-        self.image_width = self.original_image.shape[2]
-        self.image_height = self.original_image.shape[1]
-
-        if gt_alpha_mask is not None:
-            self.original_image *= gt_alpha_mask.to(self.data_device)
+        self._lazy_image = image if isinstance(image, LazyImage) else None
+        if self._lazy_image is not None:
+            self.image_width, self.image_height = image.size
+            self._original_image = None
         else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+            self._original_image = image.clamp(0.0, 1.0).to(self.data_device)
+            self.image_width, self.image_height = image.shape[2], image.shape[1]
+            if gt_alpha_mask is not None:
+                self._original_image *= gt_alpha_mask.to(self.data_device)
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -72,9 +77,36 @@ class Camera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
         self.focal = fov2focal(self.FoVx, self.full_width)
-        self.camera_rays, self.camera_rays_unnorm = self.gen_rays_from_image(self.full_height, self.full_width, self.focal, self.C2W)
-        self.shadow_depth_pts = None ## the depth map of the shadow camera at pl_pos 
-        self.distance_pts_pl = None ## distance between the depth_pts of view camera and pl_pos
+        # Dense image/ray/shadow arrays are held by shared bounded caches.
+
+    @property
+    def original_image(self):
+        return self._lazy_image.tensor(self.data_device) if self._lazy_image is not None else self._original_image
+
+    def prefetch_image(self):
+        if self._lazy_image is not None:
+            self._lazy_image.prefetch()
+
+    @property
+    def camera_rays(self):
+        return camera_rays(self)[0]
+
+    @property
+    def camera_rays_unnorm(self):
+        return camera_rays(self)[1]
+
+    @property
+    def shadow_depth_pts(self):
+        pair = HOST_SHADOWS.get(self._shadow_key)
+        return None if pair is None else pair[0]
+
+    @property
+    def distance_pts_pl(self):
+        pair = HOST_SHADOWS.get(self._shadow_key)
+        return None if pair is None else pair[1]
+
+    def cache_shadow(self, depth, distance):
+        HOST_SHADOWS.put(self._shadow_key, (depth.detach().cpu(), distance.detach().cpu()))
         
     # TODO: This is OpenCV convention, need to align with Blender world space
     def gen_rays_from_image(self, H, W, focal, c2w):

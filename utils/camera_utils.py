@@ -38,6 +38,16 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
+    from utils.data_cache import LazyImage
+    if isinstance(cam_info.image, LazyImage):
+        image = LazyImage(cam_info.image.path, resolution, cam_info.image.white_background)
+        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                      FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                      image=image, gt_alpha_mask=None, image_name=cam_info.image_name,
+                      uid=id, data_device=args.data_device, full_width=resolution[0],
+                      full_height=resolution[1], pl_pos=cam_info.pl_pos,
+                      pl_intensity=cam_info.pl_intensity, light_dir=cam_info.light_dir,
+                      source_frame=cam_info.source_frame)
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
     gt_image = resized_image_rgb[:3, ...]

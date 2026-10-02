@@ -41,6 +41,8 @@ class CameraInfo(NamedTuple):
     full_height: int = 0
     crop_offset_x: int = 0
     crop_offset_y: int = 0
+    light_dir: np.array = None
+    source_frame: dict = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud

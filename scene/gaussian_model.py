@@ -130,7 +130,7 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
-        self.spatial_lr_scale = spatial_lr_scale
+        self.spatial_lr_scale = float(spatial_lr_scale)
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -273,20 +273,13 @@ class GaussianModel:
         print(f'Cropped {(~mask).sum()} points.')
         if (~mask).sum() == 0:
             return
-        self._xyz = self._xyz[mask]
-        self._features_dc = self._features_dc[mask]
-        self._features_rest = self._features_rest[mask]
-        self._opacity = self._opacity[mask]
-        self._scaling = self._scaling[mask]
-        self._rotation = self._rotation[mask]
-        
-        if self.xyz_gradient_accum.shape[0] > 0:
-            self.xyz_gradient_accum = self.xyz_gradient_accum[mask]
-        if self.denom.shape[0] > 0:
-            self.denom = self.denom[mask]
-        if self.max_radii2D.shape[0] > 0:
-            self.max_radii2D = self.max_radii2D[mask]
-        
+        if self.optimizer is not None:
+            self.prune_points(~mask)
+        else:
+            for name in ('_xyz', '_features_dc', '_features_rest', '_opacity', '_scaling', '_rotation'):
+                setattr(self, name, nn.Parameter(getattr(self, name)[mask].detach().requires_grad_(True)))
+            if self.max_radii2D.shape[0]:
+                self.max_radii2D = self.max_radii2D[mask]
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

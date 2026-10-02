@@ -27,6 +27,7 @@ from copy import deepcopy
 from scene.cameras import Camera
 from utils.graphics_utils import cam_pos_up_forward_to_Rt
 from torchmetrics.functional.image import peak_signal_noise_ratio as psnr, structural_similarity_index_measure as ssim, learned_perceptual_image_patch_similarity as lpips
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from color_mlp import ColorMLP
 from depth_mlp import DepthMLP
@@ -57,8 +58,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         write_views_to_txt(views, dump_path)
             
     mlp_inputs = None
-    gts = []
-    renderings = []
+    metric_count = 0
+    metric_lpips = None
     psnr_sum = 0
     ssim_sum = 0
     lpips_sum = 0
@@ -104,15 +105,20 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             else:
                 torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
             if not relight_envmap:
-                gts.append(gt)
-            renderings.append(rendering)
+                prediction = rendering[:3].clamp(0, 1)[None]
+                target = gt[:3].to(prediction.device)[None]
+                if metric_lpips is None:
+                    metric_lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).to(prediction.device).eval()
+                psnr_sum += psnr(prediction, target, data_range=1.0).item()
+                ssim_sum += ssim(prediction, target, data_range=1.0).item()
+                lpips_sum += metric_lpips(prediction, target).item()
+                metric_lpips.reset()
+                metric_count += 1
             
-    if len(gts) > 0 and len(renderings) > 0:
-        gts = torch.stack(gts, dim=0)
-        renderings = torch.stack(renderings, dim=0)
-        psnr_sum = psnr(renderings, gts).item()
-        ssim_sum = ssim(renderings, gts).item()
-        lpips_sum = lpips(renderings, gts).item()
+    if metric_count > 0:
+        psnr_sum /= metric_count
+        ssim_sum /= metric_count
+        lpips_sum /= metric_count
         line = f'PSNR: {psnr_sum:.4f} SSIM: {ssim_sum:.4f} LPIPS: {lpips_sum:.4f}'
         print(line)
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), 'metrics.txt'), 'w') as f:

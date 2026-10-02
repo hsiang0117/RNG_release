@@ -58,6 +58,8 @@ class ModelParams(ParamGroup):
         self.less = 0
         self.max_training_images = 0
         self.max_reso = 512
+        self.init_ply = "points3d.ply"
+        self.scene_scale = 1.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

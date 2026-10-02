@@ -40,7 +40,10 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")) and not args.json:
+        from scene.cloud_dataset import is_cloud_dataset, read_cloud_scene
+        if args.json and is_cloud_dataset(args.source_path):
+            scene_info = read_cloud_scene(args)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")) and not args.json:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.less, args.max_training_images, '.png', args.max_reso)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")) and args.json:
             print("Found transforms_train.json file, assuming Blender data set!")

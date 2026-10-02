@@ -31,7 +31,7 @@ class DepthMLP(nn.Module):
         }
     
     def restore_from_checkpoint(self, ckpt_path):
-        ckpt, iteration = torch.load(ckpt_path)
+        ckpt, iteration = torch.load(ckpt_path, weights_only=False)
         self.load_state_dict(ckpt['model_state_dict'])
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         for state in self.optimizer.state.values():

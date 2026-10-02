@@ -43,7 +43,8 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     if pc_ckpt:
-        (model_params, first_iter) = torch.load(pc_ckpt, map_location='cuda')
+        # Full local training checkpoints contain Adam state and NumPy scalars.
+        (model_params, first_iter) = torch.load(pc_ckpt, map_location='cuda', weights_only=False)
         gaussians.restore(model_params, opt)
         print('Loaded point cloud ({} pts) from checkpoint. Iteration: {}'.format(gaussians.get_xyz.shape[0], first_iter))
         if pipe.reset_features:
@@ -78,6 +79,10 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
     ema_loss_for_log = 0.0
     loss_curve = []
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    from tools.training_monitor import Monitor, shuffled_cameras
+    monitor = Monitor(dataset.model_path, args.run_stage, scene.getTestCameras())
+    sampler = shuffled_cameras(scene.getTrainCameras())
+    starting_iteration = first_iter
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
@@ -89,9 +94,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam = next(sampler)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -112,7 +115,17 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
         gt_image = viewpoint_cam.original_image.cuda() ## [3, H, W]
         loss1 = loss_func(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * loss1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss.backward(retain_graph=True)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f'Non-finite loss at iteration {iteration}')
+        loss.backward()
+        check_grads = None
+        if iteration <= first_iter + 2 or iteration % 1000 == 0:
+            parameters = [p for g in gaussians.optimizer.param_groups for p in g['params']]
+            parameters += list(color_mlp.parameters()) if color_mlp is not None else []
+            parameters += list(depth_mlp.parameters()) if depth_mlp is not None else []
+            check_grads = all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in parameters)
+            if not check_grads:
+                raise FloatingPointError(f'Non-finite gradient at iteration {iteration}')
 
         if iteration == 1:
             print(image.shape)
@@ -133,13 +146,19 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
                     f.write(f'{datetime.now().strftime("%H:%M:%S")} {line}\n')
                 progress_bar.update(10)
                 loss_curve.append(loss.item())
-                plt.figure()
-                plt.plot(loss_curve)
-                plt.savefig(os.path.join(dataset.model_path, log_txt_file_name.replace(".txt", ".png")))
-                plt.close()
+                if iteration % 1000 == 0:
+                    plt.figure()
+                    plt.plot(loss_curve)
+                    plt.savefig(os.path.join(dataset.model_path, f'loss_{args.run_stage}.png'))
+                    plt.close()
             if iteration == opt.iterations:
                 progress_bar.close()
                 
+            if iteration == first_iter or iteration % 100 == 0:
+                monitor.record(iteration, loss, image, gt_image, gaussians, check_grads)
+            if args.rendertest_interval > 0 and iteration % args.rendertest_interval == 0:
+                monitor.preview(iteration, gaussians, render, pipe, background, color_mlp, depth_mlp)
+
             # Log and save
             # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), color_mlp)
             if (iteration in saving_iterations):
@@ -200,13 +219,16 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
                     depth_mlp.optimizer.param_groups[0]['lr'] *= 0.75
                     print(f"[ITER {iteration}] depth_mlp lr -> {depth_mlp.optimizer.param_groups[0]['lr']:.2e}")
 
+    monitor.finish(starting_iteration, opt.iterations, gaussians)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+            from datetime import datetime
+            unique_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.model_path = os.path.join("./output/", unique_str)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -279,12 +301,20 @@ if __name__ == "__main__":
     parser.add_argument("--load_d_mlp", type=str, default = None)
     parser.add_argument("--loss", type=str, default="l1", choices=['l1', 'l2', 'logl1', 'logl2'])
     parser.add_argument("--crop_pc", type=float, default=0.0)
+    parser.add_argument("--run_stage", choices=['forward', 'deferred'], default='forward')
+    parser.add_argument("--rendertest_interval", type=int, default=1000)
     args = parser.parse_args(sys.argv[1:])
+    if not args.model_path:
+        from datetime import datetime
+        args.model_path = os.path.abspath(os.path.join('output', datetime.now().strftime('%Y%m%d_%H%M%S')))
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations = args.save_iterations
     
     ## save cmd-line args to txt file
     os.makedirs(args.model_path, exist_ok=True)
+    import json
+    with open(os.path.join(args.model_path, f'training_args_{args.run_stage}.json'), 'w') as f:
+        json.dump(vars(args), f, indent=2)
             
     ## recursively backup all python scripts
     os.makedirs(os.path.join(args.model_path, "codes"), exist_ok=True)

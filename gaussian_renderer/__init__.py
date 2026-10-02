@@ -30,6 +30,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     Background tensor (bg_color) must be on GPU!
     """
     
+    directional = pipe.directional_light or bool(relight_envmap)
+    if directional and viewpoint_camera.light_dir is None:
+        raise ValueError('Directional lighting requires a world-space light_dir')
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -100,8 +103,12 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
                 ## if not shadow_map:  rasterize -> color_mlp (the simple defer_shading operation)
                 colors_precomp = in_feature ## shape: [N, in_channels] --> check cuda part, config.h: NUM_CHANNELS
             else:
-                pl_direction = viewpoint_camera.pl_pos.reshape(1, 3).expand(pc.get_xyz.shape[0], 3) - pc.get_xyz ## shape: [N, 3]
-                pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
+                if directional:
+                    pl_direction = torch.nn.functional.normalize(viewpoint_camera.light_dir, dim=0).expand_as(pc.get_xyz)
+                    pl_distance = torch.ones((len(pc.get_xyz), 1), device=pc.get_xyz.device)
+                else:
+                    pl_direction = viewpoint_camera.pl_pos.reshape(1, 3).expand_as(pc.get_xyz) - pc.get_xyz
+                    pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
                 camera_direction = viewpoint_camera.camera_center - pc.get_xyz ## shape: [N, 3]
                 mlp_input = torch.cat([
                     in_feature, 
@@ -133,7 +140,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         cov3D_precomp = cov3D_precomp)
     alpha_mask = rendered_alpha > 0.0 ## [1, H, W]
     ##! correct the depth for where total alpha is not 1.0
-    rendered_depth = torch.where(alpha_mask, rendered_depth / rendered_alpha, rendered_depth.max())
+    rendered_depth = torch.where(alpha_mask, rendered_depth / rendered_alpha.clamp_min(1e-8), rendered_depth.max())
     
     if pipe.output_depth or pipe.output_alpha or pipe.output_feature:
         crop_offset_x, crop_offset_y = int(viewpoint_camera.crop_offset_x), int(viewpoint_camera.crop_offset_y)
@@ -196,10 +203,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     if pipe.shadow_map:
         
-        with torch.set_grad_enabled(pipe.shadow_grad):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and pipe.shadow_grad):
             if iteration > pipe.enable_shadow_from: 
                 if iteration % pipe.shadow_cache_rebuild == 0 or viewpoint_camera.shadow_depth_pts is None or viewpoint_camera.distance_pts_pl is None:
-                    if not relight_envmap:
+                    if not directional:
                         ## set up a virtual ShadowCamera and rasterize to get the shadow_depth
                         shadow_cam_pos = viewpoint_camera.pl_pos.cpu().numpy().reshape(-1) ## shape: [3,]
                                     # shadow_cam_dir = available_depth_pts.reshape(3, -1).mean(-1).cpu().numpy().reshape(-1) - shadow_cam_pos ## shape: [3,]
@@ -275,8 +282,11 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
                         light_dir = normalize(viewpoint_camera.light_dir).float().cuda()
                         shadow_cam_pos = light_dir * 3.0
                         shadow_cam_forward = -light_dir
-                        shadow_cam_right = -normalize(torch.cross(shadow_cam_forward, torch.tensor([0.0, 0.0, 1.0]).float().cuda()))
-                        shadow_cam_up = torch.cross(shadow_cam_forward, shadow_cam_right)
+                        up_axis = torch.tensor([0.0, 0.0, 1.0], device=light_dir.device)
+                        if torch.abs(torch.dot(shadow_cam_forward, up_axis)) > 0.99:
+                            up_axis = torch.tensor([0.0, 1.0, 0.0], device=light_dir.device)
+                        shadow_cam_right = -torch.nn.functional.normalize(torch.linalg.cross(shadow_cam_forward, up_axis), dim=0)
+                        shadow_cam_up = torch.linalg.cross(shadow_cam_forward, shadow_cam_right)
                         shadow_raster_settings = OrthographicGaussianRasterizationSettings(
                                         image_height=int(viewpoint_camera.image_height),
                                         image_width=int(viewpoint_camera.image_width),
@@ -333,16 +343,18 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
                         shadow_depth = shadow_depth.reshape(1, 1, viewpoint_camera.image_height, viewpoint_camera.image_width).cuda()
 
                     ##! correct the depth for where total alpha is not 1.0
-                    shadow_depth = torch.where(shadow_alpha > 0, shadow_depth / shadow_alpha, shadow_depth.max())
+                    shadow_depth = torch.where(shadow_alpha > 0, shadow_depth / shadow_alpha.clamp_min(1e-8), shadow_depth.max())
 
                     shadow_depth_pts = torch.nn.functional.grid_sample(shadow_depth, grid, align_corners=True, mode='bilinear').reshape(1, H, W)
                     shadow_depth_pts = torch.where(alpha_mask, shadow_depth_pts, torch.zeros_like(shadow_depth_pts)) ## [1, H, W]
-                    distance_pts_pl = torch.norm(depth_pts - torch.tensor(shadow_cam_pos).cuda().reshape(3,1,1).expand_as(depth_pts), dim=0).reshape(1, H, W)
+                    if directional:
+                        distance_pts_pl = projected_depth.reshape(1, H, W)
+                    else:
+                        distance_pts_pl = torch.norm(depth_pts - torch.as_tensor(shadow_cam_pos, device=depth_pts.device).reshape(3,1,1), dim=0).reshape(1, H, W)
                     distance_pts_pl = torch.where(alpha_mask, distance_pts_pl, torch.zeros_like(distance_pts_pl)) ## [1, H, W]
                     
                     ## remember them for the future iterations
-                    viewpoint_camera.shadow_depth_pts = shadow_depth_pts.detach().cpu()
-                    viewpoint_camera.distance_pts_pl = distance_pts_pl.detach().cpu()
+                    viewpoint_camera.cache_shadow(shadow_depth_pts, distance_pts_pl)
 
                 else:
                     ## use cached shadow information
@@ -391,10 +403,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         
         ## [fjh] if defer_shading, then this is the last operation. All features are screen-space and fed into mlp -> final rendering.
         if pipe.defer_shading:
-            if relight_envmap is not None:
+            if directional:
                 light_dir = normalize(viewpoint_camera.light_dir).float().cuda()
                 pl_direction = light_dir.reshape(1, 3).expand(H*W, -1) ## [H*W, 3]
-                pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1) * 100.0
+                pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
             else:
                 pl_direction = viewpoint_camera.pl_pos.reshape(1, 3).expand(H*W, -1) - depth_pts.permute(1, 2, 0).reshape(-1, 3) ## shape: [H*W, 3]
                 pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
@@ -425,10 +437,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
             
             shadow_hint = torch.nn.functional.grid_sample(shadow_hint.reshape(1, 2, H, W), grid, align_corners=True).reshape(2, -1).permute(1, 0) ## [N, 2]
             
-            if relight_envmap is not None:
+            if directional:
                 light_dir = normalize(viewpoint_camera.light_dir).float().cuda()
                 pl_direction = light_dir.reshape(1, 3).expand_as(pc.get_xyz, -1) ## [H*W, 3]
-                pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1) * 100.0
+                pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
             else:
                 pl_direction = viewpoint_camera.pl_pos.reshape(1, 3).expand_as(pc.get_xyz) - pc.get_xyz ## shape: [N, 3]
                 pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
@@ -456,8 +468,12 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
             res = res[:3] ## [3, full_height, full_width]
 
     else: ## the simple defer_shading operation
-        pl_direction = viewpoint_camera.pl_pos.reshape(1, 3).expand(H*W, -1) - depth_pts.permute(1, 2, 0).reshape(-1, 3) ## shape: [H*W, 3]
-        pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
+        if directional:
+            pl_direction = torch.nn.functional.normalize(viewpoint_camera.light_dir, dim=0).expand(H*W, -1)
+            pl_distance = torch.ones((H*W, 1), device=depth_pts.device)
+        else:
+            pl_direction = viewpoint_camera.pl_pos.reshape(1, 3).expand(H*W, -1) - depth_pts.permute(1, 2, 0).reshape(-1, 3)
+            pl_distance = torch.norm(pl_direction, dim=1).reshape(-1, 1)
         camera_direction = viewpoint_camera.camera_center.reshape(1, 3).expand(H*W, -1) - depth_pts.permute(1, 2, 0).reshape(-1, 3) ## shape: [H*W, 3]
         mlp_input = rendered_image.permute(1, 2, 0).reshape(-1, pipe.in_channels)
         mlp_input = torch.cat([
