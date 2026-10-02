@@ -39,6 +39,12 @@ def main():
     assert len(scene.getTrainCameras()) == 1308 and len(scene.getTestCameras()) == 152
     gaussians.training_setup(op.extract(args))
     camera = scene.getTrainCameras()[0]
+    other_sun = next(c for c in scene.getTrainCameras()
+                     if c.source_frame['camera_index'] == camera.source_frame['camera_index']
+                     and c.source_frame['time_index'] != camera.source_frame['time_index'])
+    paired_views = [camera, other_sun]
+    np.testing.assert_allclose(camera.C2W, other_sun.C2W, atol=2e-6, rtol=2e-6)
+    assert not torch.allclose(camera.light_dir, other_sun.light_dir)
     expected = torch.from_numpy(np.array(Image.open(Path(args.source_path) / camera.image_name).convert('RGB'))).permute(2, 0, 1).float().cuda() / 255.0
     assert torch.equal(camera.original_image, expected), 'GT pixel conversion changed'
     rays, unnorm = camera.gen_rays_from_image(camera.full_height, camera.full_width, camera.focal, camera.C2W)
@@ -47,6 +53,9 @@ def main():
     results = dict(split='1308 train / 152 test', initial_points=len(gaussians.get_xyz),
                    pixels='bit identical to dataset RGB', rays='matches upstream within 2e-6',
                    scene_scale=args.scene_scale)
+    results['sun_response_frames'] = [dict(file_path=c.image_name,
+                                          camera_index=c.source_frame['camera_index'],
+                                          time_index=c.source_frame['time_index']) for c in paired_views]
     # Camera and point normalization preserves projected positions.
     points = scene.gaussians.get_xyz[:1000].detach().cpu().numpy() / args.scene_scale
     original_c2w = np.asarray(camera.source_frame['transform_matrix']).copy()
@@ -75,7 +84,7 @@ def main():
         start = time.monotonic()
         losses = []
         for j in range(2):
-            view = scene.getTrainCameras()[j]
+            view = paired_views[j]
             res = render(view, gaussians, pipe, background, color_mlp=color, depth_mlp=depth,
                          iteration=30000+j)
             image, gt = res['render'], view.original_image
@@ -96,8 +105,8 @@ def main():
                               cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                               cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved())
         with torch.no_grad():
-            a = render(scene.getTrainCameras()[0], gaussians, pipe, background, color_mlp=color, depth_mlp=depth, iteration=30010)['render']
-            b = render(scene.getTrainCameras()[1], gaussians, pipe, background, color_mlp=color, depth_mlp=depth, iteration=30010)['render']
+            a = render(paired_views[0], gaussians, pipe, background, color_mlp=color, depth_mlp=depth, iteration=30010)['render']
+            b = render(paired_views[1], gaussians, pipe, background, color_mlp=color, depth_mlp=depth, iteration=30010)['render']
             assert not a.requires_grad and not b.requires_grad
             assert (a-b).abs().mean() > 0, 'Changing the sun has no effect'
             results[stage]['same_camera_sun_change_mae'] = float((a-b).abs().mean())
