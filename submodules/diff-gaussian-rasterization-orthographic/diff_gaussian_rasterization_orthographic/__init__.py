@@ -101,7 +101,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         return color, radii, depth, alpha
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_out_depth, grad_out_alpha, _):
+    def backward(ctx, grad_out_color, _grad_radii, grad_out_depth, grad_out_alpha):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -119,9 +119,13 @@ class _RasterizeGaussians(torch.autograd.Function):
                 cov3Ds_precomp, 
                 raster_settings.viewmatrix, 
                 raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
-                grad_out_color, 
+                raster_settings.light_dir,
+                raster_settings.cam_center,
+                raster_settings.cam_right,
+                raster_settings.cam_up,
+                grad_out_color,
+                grad_out_depth,
+                grad_out_alpha,
                 sh, 
                 raster_settings.sh_degree, 
                 raster_settings.campos,

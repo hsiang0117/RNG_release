@@ -136,9 +136,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
     const torch::Tensor& projmatrix,
-	const float tan_fovx,
-	const float tan_fovy,
+	const torch::Tensor& light_dirs,
+	const torch::Tensor& cam_center,
+	const torch::Tensor& cam_right,
+	const torch::Tensor& cam_up,
     const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_depth,
+    const torch::Tensor& dL_dout_alpha,
 	const torch::Tensor& sh,
 	const int degree,
 	const torch::Tensor& campos,
@@ -167,6 +171,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dsh = torch::zeros({P, M, 3}, means3D.options());
   torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
+  torch::Tensor dL_ddepths = torch::zeros({P}, means3D.options());
   
   if(P != 0)
   {  
@@ -183,13 +188,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  viewmatrix.contiguous().data<float>(),
 	  projmatrix.contiguous().data<float>(),
 	  campos.contiguous().data<float>(),
-	  tan_fovx,
-	  tan_fovy,
+	  light_dirs.contiguous().data_ptr<float>(),
+	  cam_center.contiguous().data_ptr<float>(),
+	  cam_right.contiguous().data_ptr<float>(),
+	  cam_up.contiguous().data_ptr<float>(),
 	  radii.contiguous().data<int>(),
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
 	  dL_dout_color.contiguous().data<float>(),
+	  dL_dout_depth.contiguous().data_ptr<float>(),
+	  dL_dout_alpha.contiguous().data_ptr<float>(),
+	  dL_ddepths.data_ptr<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dconic.contiguous().data<float>(),  
 	  dL_dopacity.contiguous().data<float>(),

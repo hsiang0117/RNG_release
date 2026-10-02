@@ -1,0 +1,18 @@
+# Server environment: Python 3.12, CUDA Toolkit 12.8, RTX 4090
+# Exact resolved versions are recorded in requirements-server-lock.txt.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+setuptools==80.9.0
+wheel
+ninja
+numpy==2.5.2
+scipy
+plyfile
+Pillow
+tqdm
+matplotlib
+torchmetrics
+opencv-python==5.0.0.93
+OpenEXR
+Imath
+tensorboard

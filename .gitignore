@@ -12,3 +12,11 @@ test_camera.py
 *.pth
 *.npy
 *.so
+# Local server environment and build artifacts
+.venv/
+dependency-cache/
+temporary-build/
+external-dependencies/
+environment-backups/
+*.egg-info/
+dist/

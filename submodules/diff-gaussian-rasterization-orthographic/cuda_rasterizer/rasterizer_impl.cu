@@ -362,12 +362,18 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* campos,
-	const float tan_fovx, float tan_fovy,
+	const float* light_dir,
+	const float* cam_center,
+	const float* cam_right,
+	const float* cam_up,
 	const int* radii,
 	char* geom_buffer,
 	char* binning_buffer,
 	char* img_buffer,
 	const float* dL_dpix,
+	const float* dL_dout_depth,
+	const float* dL_dout_alpha,
+	float* dL_ddepths,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
@@ -388,8 +394,6 @@ void CudaRasterizer::Rasterizer::backward(
 		radii = geomState.internal_radii;
 	}
 
-	const float focal_y = height / (2.0f * tan_fovy);
-	const float focal_x = width / (2.0f * tan_fovx);
 
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -411,6 +415,10 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		geomState.depths,
+		dL_dout_depth,
+		dL_dout_alpha,
+		dL_ddepths,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
@@ -429,10 +437,12 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec4*)rotations,
 		scale_modifier,
 		cov3D_ptr,
-		viewmatrix,
-		projmatrix,
-		focal_x, focal_y,
-		tan_fovx, tan_fovy,
+		width, height,
+		(glm::vec3*)light_dir,
+		(glm::vec3*)cam_center,
+		(glm::vec3*)cam_right,
+		(glm::vec3*)cam_up,
+		dL_ddepths,
 		(glm::vec3*)campos,
 		(float3*)dL_dmean2D,
 		dL_dconic,

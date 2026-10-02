@@ -138,139 +138,36 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-// Backward version of INVERSE 2D covariance matrix computation
-// (due to length launched as separate kernel before other 
-// backward steps contained in preprocess)
-__global__ void computeCov2DCUDA(int P,
-	const float3* means,
-	const int* radii,
-	const float* cov3Ds,
-	const float h_x, float h_y,
-	const float tan_fovx, float tan_fovy,
-	const float* view_matrix,
-	const float* dL_dconics,
-	float3* dL_dmeans,
-	float* dL_dcov)
+// Differentiate the fixed orthographic projection used by forward.cu.
+// The covariance uses W/2,H/2, while the mean uses (W-1)/2,(H-1)/2.
+__global__ void computeCov2DCUDA(int P, const int* radii,
+    const float* cov3Ds, int W, int H,
+    const glm::vec3* cam_right, const glm::vec3* cam_up,
+    const float* dL_dconics, float* dL_dcov)
 {
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P || !(radii[idx] > 0))
-		return;
-
-	// Reading location of 3D covariance for this Gaussian
-	const float* cov3D = cov3Ds + 6 * idx;
-
-	// Fetch gradients, recompute 2D covariance and relevant 
-	// intermediate forward results needed in the backward.
-	float3 mean = means[idx];
-	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
-	float3 t = transformPoint4x3(mean, view_matrix);
-	
-	const float limx = 1.3f * tan_fovx;
-	const float limy = 1.3f * tan_fovy;
-	const float txtz = t.x / t.z;
-	const float tytz = t.y / t.z;
-	t.x = min(limx, max(-limx, txtz)) * t.z;
-	t.y = min(limy, max(-limy, tytz)) * t.z;
-	
-	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
-	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
-
-	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
-		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
-		0, 0, 0);
-
-	glm::mat3 W = glm::mat3(
-		view_matrix[0], view_matrix[4], view_matrix[8],
-		view_matrix[1], view_matrix[5], view_matrix[9],
-		view_matrix[2], view_matrix[6], view_matrix[10]);
-
-	glm::mat3 Vrk = glm::mat3(
-		cov3D[0], cov3D[1], cov3D[2],
-		cov3D[1], cov3D[3], cov3D[4],
-		cov3D[2], cov3D[4], cov3D[5]);
-
-	glm::mat3 T = W * J;
-
-	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
-
-	// Use helper variables for 2D covariance entries. More compact.
-	float a = cov2D[0][0] += 0.3f;
-	float b = cov2D[0][1];
-	float c = cov2D[1][1] += 0.3f;
-
-	float denom = a * c - b * b;
-	float dL_da = 0, dL_db = 0, dL_dc = 0;
-	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
-
-	if (denom2inv != 0)
-	{
-		// Gradients of loss w.r.t. entries of 2D covariance matrix,
-		// given gradients of loss w.r.t. conic matrix (inverse covariance matrix).
-		// e.g., dL / da = dL / d_conic_a * d_conic_a / d_a
-		dL_da = denom2inv * (-c * c * dL_dconic.x + 2 * b * c * dL_dconic.y + (denom - a * c) * dL_dconic.z);
-		dL_dc = denom2inv * (-a * a * dL_dconic.z + 2 * a * b * dL_dconic.y + (denom - a * c) * dL_dconic.x);
-		dL_db = denom2inv * 2 * (b * c * dL_dconic.x - (denom + 2 * b * b) * dL_dconic.y + a * b * dL_dconic.z);
-
-		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
-		// given gradients w.r.t. 2D covariance matrix (diagonal).
-		// cov2D = transpose(T) * transpose(Vrk) * T;
-		dL_dcov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_da + T[0][0] * T[1][0] * dL_db + T[1][0] * T[1][0] * dL_dc);
-		dL_dcov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_da + T[0][1] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc);
-		dL_dcov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_da + T[0][2] * T[1][2] * dL_db + T[1][2] * T[1][2] * dL_dc);
-
-		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
-		// given gradients w.r.t. 2D covariance matrix (off-diagonal).
-		// Off-diagonal elements appear twice --> double the gradient.
-		// cov2D = transpose(T) * transpose(Vrk) * T;
-		dL_dcov[6 * idx + 1] = 2 * T[0][0] * T[0][1] * dL_da + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][1] * dL_dc;
-		dL_dcov[6 * idx + 2] = 2 * T[0][0] * T[0][2] * dL_da + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][2] * dL_dc;
-		dL_dcov[6 * idx + 4] = 2 * T[0][2] * T[0][1] * dL_da + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_db + 2 * T[1][1] * T[1][2] * dL_dc;
-	}
-	else
-	{
-		for (int i = 0; i < 6; i++)
-			dL_dcov[6 * idx + i] = 0;
-	}
-
-	// Gradients of loss w.r.t. upper 2x3 portion of intermediate matrix T
-	// cov2D = transpose(T) * transpose(Vrk) * T;
-	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_da +
-		(T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_db;
-	float dL_dT01 = 2 * (T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_da +
-		(T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_db;
-	float dL_dT02 = 2 * (T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_da +
-		(T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_db;
-	float dL_dT10 = 2 * (T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc +
-		(T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_db;
-	float dL_dT11 = 2 * (T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_dc +
-		(T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_db;
-	float dL_dT12 = 2 * (T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc +
-		(T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_db;
-
-	// Gradients of loss w.r.t. upper 3x2 non-zero entries of Jacobian matrix
-	// T = W * J
-	float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
-	float dL_dJ02 = W[2][0] * dL_dT00 + W[2][1] * dL_dT01 + W[2][2] * dL_dT02;
-	float dL_dJ11 = W[1][0] * dL_dT10 + W[1][1] * dL_dT11 + W[1][2] * dL_dT12;
-	float dL_dJ12 = W[2][0] * dL_dT10 + W[2][1] * dL_dT11 + W[2][2] * dL_dT12;
-
-	float tz = 1.f / t.z;
-	float tz2 = tz * tz;
-	float tz3 = tz2 * tz;
-
-	// Gradients of loss w.r.t. transformed Gaussian mean t
-	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
-	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
-	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
-
-	// Account for transformation of mean to t
-	// t = transformPoint4x3(mean, view_matrix);
-	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
-
-	// Gradients of loss w.r.t. Gaussian means, but only the portion 
-	// that is caused because the mean affects the covariance matrix.
-	// Additional mean gradient is accumulated in BACKWARD::preprocess.
-	dL_dmeans[idx] = dL_dmean;
+    const int idx = cg::this_grid().thread_rank();
+    if (idx >= P || radii[idx] <= 0) return;
+    const glm::vec3 u = (0.5f * W) * *cam_right;
+    const glm::vec3 v = (0.5f * H) * *cam_up;
+    const float* q = cov3Ds + 6 * idx;
+    const glm::mat3 sigma(q[0],q[1],q[2], q[1],q[3],q[4], q[2],q[4],q[5]);
+    const float a = glm::dot(u, sigma*u) + 0.3f;
+    const float b = glm::dot(u, sigma*v);
+    const float c = glm::dot(v, sigma*v) + 0.3f;
+    const float det = a*c-b*b;
+    const glm::mat2 inverse(c/det, -b/det, -b/det, a/det);
+    // render stores half the scalar off-diagonal conic derivative.
+    const glm::mat2 g(dL_dconics[4*idx], dL_dconics[4*idx+1],
+                      dL_dconics[4*idx+1], dL_dconics[4*idx+3]);
+    const glm::mat2 ds = -inverse*g*inverse;
+    const float ga=ds[0][0], gb=2.0f*ds[0][1], gc=ds[1][1];
+    float* out=dL_dcov+6*idx;
+    out[0]=u.x*u.x*ga+u.x*v.x*gb+v.x*v.x*gc;
+    out[3]=u.y*u.y*ga+u.y*v.y*gb+v.y*v.y*gc;
+    out[5]=u.z*u.z*ga+u.z*v.z*gb+v.z*v.z*gc;
+    out[1]=2*u.x*u.y*ga+(u.x*v.y+u.y*v.x)*gb+2*v.x*v.y*gc;
+    out[2]=2*u.x*u.z*ga+(u.x*v.z+u.z*v.x)*gb+2*v.x*v.z*gc;
+    out[4]=2*u.y*u.z*ga+(u.y*v.z+u.z*v.y)*gb+2*v.y*v.z*gc;
 }
 
 // Backward pass for the conversion of scale and rotation to a 
@@ -320,9 +217,9 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 
 	// Gradients of loss w.r.t. scale
 	glm::vec3* dL_dscale = dL_dscales + idx;
-	dL_dscale->x = glm::dot(Rt[0], dL_dMt[0]);
-	dL_dscale->y = glm::dot(Rt[1], dL_dMt[1]);
-	dL_dscale->z = glm::dot(Rt[2], dL_dMt[2]);
+	dL_dscale->x = mod * glm::dot(Rt[0], dL_dMt[0]);
+	dL_dscale->y = mod * glm::dot(Rt[1], dL_dMt[1]);
+	dL_dscale->z = mod * glm::dot(Rt[2], dL_dMt[2]);
 
 	dL_dMt[0] *= s.x;
 	dL_dMt[1] *= s.y;
@@ -353,7 +250,12 @@ __global__ void preprocessCUDA(
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
 	const float scale_modifier,
-	const float* proj,
+	int W, int H,
+	const glm::vec3* light_dir,
+	const glm::vec3* cam_center,
+	const glm::vec3* cam_right,
+	const glm::vec3* cam_up,
+	const float* dL_ddepths,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
 	glm::vec3* dL_dmeans,
@@ -367,24 +269,17 @@ __global__ void preprocessCUDA(
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
-	float3 m = means[idx];
-
-	// Taking care of gradients from the screenspace points
-	float4 m_hom = transformPoint4x4(m, proj);
-	float m_w = 1.0f / (m_hom.w + 0.0000001f);
-
-	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
-	// from rendering procedure
-	glm::vec3 dL_dmean;
-	float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
-	float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
-	dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
-	dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
-	dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
-
-	// That's the second part of the mean gradient. Previous computation
-	// of cov2D and following SH conversion also affects it.
-	dL_dmeans[idx] += dL_dmean;
+    const glm::vec3 m(means[idx].x, means[idx].y, means[idx].z);
+    const glm::vec3 delta=m-*cam_center;
+    const glm::vec3 planar=delta-glm::dot(delta,*light_dir)* *light_dir;
+    const float px=(glm::dot(planar,*cam_right)+1.0f)*0.5f*(W-1)+0.5f;
+    const float py=(glm::dot(planar,*cam_up)+1.0f)*0.5f*(H-1)+0.5f;
+    const glm::vec3 bx=*cam_right-glm::dot(*cam_right,*light_dir)* *light_dir;
+    const glm::vec3 by=*cam_up-glm::dot(*cam_up,*light_dir)* *light_dir;
+    // Convert render's NDC proxy gradient back to the actual mean mapping.
+    const float gx=px < W-0.5f ? float(W-1)/W*dL_dmean2D[idx].x : 0.0f;
+    const float gy=py < H-0.5f ? float(H-1)/H*dL_dmean2D[idx].y : 0.0f;
+    dL_dmeans[idx] += bx*gx+by*gy+*light_dir*dL_ddepths[idx];
 
 	// Compute gradient updates due to computing colors from SHs
 	if (shs)
@@ -409,6 +304,10 @@ renderCUDA(
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ depths,
+	const float* __restrict__ dL_dout_depth,
+	const float* __restrict__ dL_dout_alpha,
+	float* __restrict__ dL_ddepths,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
@@ -452,6 +351,9 @@ renderCUDA(
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 
+	float accum_depth=0, last_depth=0;
+	const float grad_depth=inside ? dL_dout_depth[pix_id] : 0;
+	const float grad_alpha=inside ? dL_dout_alpha[pix_id] : 0;
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 
@@ -522,7 +424,12 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+			accum_depth=last_alpha*last_depth+(1.0f-last_alpha)*accum_depth;
+			last_depth=depths[global_id];
+			dL_dalpha += (last_depth-accum_depth)*grad_depth;
+			atomicAdd(&dL_ddepths[global_id],dchannel_dcolor*grad_depth);
 			dL_dalpha *= T;
+			dL_dalpha += T_final/(1.0f-alpha)*grad_alpha;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
@@ -533,6 +440,9 @@ renderCUDA(
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
+
+			// Alpha saturation blocks footprint/opacity gradients, not color/depth gradients.
+			if (con_o.w * G >= 0.99f) continue;
 
 			// Helpful reusable temporary variables
 			const float dL_dG = con_o.w * dL_dalpha;
@@ -566,10 +476,12 @@ void BACKWARD::preprocess(
 	const glm::vec4* rotations,
 	const float scale_modifier,
 	const float* cov3Ds,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
+	int W, int H,
+	const glm::vec3* light_dir,
+	const glm::vec3* cam_center,
+	const glm::vec3* cam_right,
+	const glm::vec3* cam_up,
+	const float* dL_ddepths,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
 	const float* dL_dconic,
@@ -582,21 +494,10 @@ void BACKWARD::preprocess(
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
 	// Somewhat long, thus it is its own kernel rather than being part of 
-	// "preprocess". When done, loss gradient w.r.t. 3D means has been
-	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
-	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
-		P,
-		means3D,
-		radii,
-		cov3Ds,
-		focal_x,
-		focal_y,
-		tan_fovx,
-		tan_fovy,
-		viewmatrix,
-		dL_dconic,
-		(float3*)dL_dmean3D,
-		dL_dcov3D);
+	// "preprocess". The fixed orthographic covariance is independent of
+	// the mean; this stage computes only the 3D covariance gradient.
+    computeCov2DCUDA<<<(P+255)/256,256>>>(
+        P, radii, cov3Ds, W, H, cam_right, cam_up, dL_dconic, dL_dcov3D);
 
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
@@ -610,7 +511,12 @@ void BACKWARD::preprocess(
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
-		projmatrix,
+		W, H,
+		light_dir,
+		cam_center,
+		cam_right,
+		cam_up,
+		dL_ddepths,
 		campos,
 		(float3*)dL_dmean2D,
 		(glm::vec3*)dL_dmean3D,
@@ -633,6 +539,10 @@ void BACKWARD::render(
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* depths,
+	const float* dL_dout_depth,
+	const float* dL_dout_alpha,
+	float* dL_ddepths,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
@@ -649,6 +559,10 @@ void BACKWARD::render(
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		depths,
+		dL_dout_depth,
+		dL_dout_alpha,
+		dL_ddepths,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
